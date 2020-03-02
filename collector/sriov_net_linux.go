@@ -20,6 +20,7 @@ const (
 	totalVfFile      = "sriov_totalvfs"
 	pfNameFile = "/net"
 	netClassFile = "/class"
+	driverFile = "/driver"
 	netClass = 0x020000
 )
 
@@ -33,31 +34,48 @@ func init() {
 type vfWithRoot map[string]string
 type sriovStats map[string]float64
 
+
+//sriovNetCollector implements the collector interface to be picked up by node exporter.
 type sriovNetCollector struct {
 	logger       log.Logger
 }
+//sriovStatReader is an interface which takes in the physical function name and vf id and returns the stats for the VF
 type sriovStatReader interface {
 	ReadStats(vfID string, pfName string) sriovStats
 }
+
+//NewSriovNetCollector returns the collector required for registration with node exporter
 func NewSriovNetCollector(logger log.Logger) (Collector, error){
 	s :=  &sriovNetCollector{
 		logger: logger,
 	}
 	return s , nil
 }
-//statReaderForPF returns the correct stat reader for the given PF
-func statReaderForPF (pf string, c *sriovNetCollector) sriovStatReader {
-	_ = pf
-	return i40e7xxReader{c.logger}
-}
 
+//statReaderForPF returns the correct stat reader for the given PF
+//currently only i40e is implemented, but other drivers can be implemented and picked up here.
+func statReaderForPF (pf string) sriovStatReader {
+	pfDriverPath := filepath.Join(sysBusPci, pf, driverFile)
+	driverInfo, _ := os.Readlink(pfDriverPath)
+	pfDriver := filepath.Base(driverInfo)
+	switch pfDriver {
+	case "i40e":
+		return i40eReader{}
+	default:
+		return nil
+	}
+}
+// Update looks for all SRIOV Network PFs on the system, looks for the VFs for each, and reports per VF stats.
 func (c *sriovNetCollector) Update(ch chan<- prometheus.Metric) error {
 	pfList, err := c.getSriovPFs()
 	if err != nil {
 		return err
 	}
 	for _, pf := range pfList {
-		reader := statReaderForPF(pf, c)
+		reader := statReaderForPF(pf)
+		if reader == nil {
+			continue
+		}
 		vfs, err  := vfList(pf)
 		if err != nil{
 			continue
@@ -170,6 +188,7 @@ func vfList(pfAddress string) (vfWithRoot, error) {
 	return vfList, nil
 }
 
+//getPFName resolves the system's name for a physical interface from the PCI address linked to it.
 func getPFName (device string) string {
 	pfdir, err  := ioutil.ReadDir(filepath.Join(sysBusPci,device,pfNameFile))
 	if err != nil {
@@ -178,11 +197,12 @@ func getPFName (device string) string {
 	return pfdir[0].Name()
 }
 
-type i40e7xxReader struct {
-	 log.Logger
+//i40eReader is able to read stats from Physical functions running the i40e driver.
+type i40eReader struct {
 }
 
-func (r i40e7xxReader) ReadStats(pfName string, vfID string ) sriovStats {
+//ReadStats takes in the name of a PF and the VF Id and returns a stats object.
+func (r i40eReader) ReadStats(pfName string, vfID string ) sriovStats {
 	stats := make(sriovStats, 0)
 	statroot   := fmt.Sprintf("/sys/class/net/%s/device/sriov/%s/stats/", pfName, vfID)
 	files , err := ioutil.ReadDir(statroot)
